@@ -12,13 +12,16 @@ from modelscope import snapshot_download
 from diffsynth import ModelManager, StepVideoPipeline, save_video
 
 ###############################################################################
-# You can set STEPVIDEO_MODE to one of: "standard", "quantized", or "low_vram"
-# ENV example:
-#   STEPVIDEO_MODE=quantized cog build
-#   cog predict -i prompt="..."   # uses float8 for diffusion
+# This script can dynamically switch between the following modes in a single
+# container run:
+#   • "standard"  (bfloat16 diffusion, ~80G VRAM)
+#   • "quantized" (float8 diffusion, ~40G VRAM)
+#   • "low_vram"  (bfloat16 diffusion but aggressively reduces VRAM usage)
 #
-# If STEPVIDEO_MODE is "low_vram", we still load bfloat16 but also default
-# to more aggressive VRAM usage settings in setup below.
+# Some parameters, such as 'tiled', are only intended for low-level VRAM usage.
+#   • standard/quantized modes do not usually benefit from 'tiled' 
+#     (though they won't error if you manually set it).
+#   • low_vram mode sets 'tiled' to True by default to reduce GPU usage.
 ###############################################################################
 
 MODEL_CACHE = "models"
@@ -50,13 +53,38 @@ def download_weights(url: str, dest: str) -> None:
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        """Load the model into memory to make running multiple predictions efficient"""
-        # Attempt custom tar model download first, else fallback
+        """Load the model into memory to be used repeatedly for inference"""
+        # Initialize mode configurations
+        self.pipelines = {}
+        self.mode_config = {
+            "standard": {
+                "diffusion_dtype": torch.bfloat16,
+                "vram_params": None,      # Unlimited VRAM (~80G)
+                "default_tiled": False,
+                "default_steps": 30,
+                "load_vae_with_diffusion": True,  # Standard loads VAE with diffusion
+            },
+            "quantized": {
+                "diffusion_dtype": torch.float8_e4m3fn,
+                "vram_params": None,      # Unlimited VRAM (~40G)
+                "default_tiled": False,
+                "default_steps": 30,
+                "load_vae_with_diffusion": False,  # Load VAE separately
+            },
+            "low_vram": {
+                "diffusion_dtype": torch.bfloat16,
+                "vram_params": 0,         # Aggressive VRAM management (~24G)
+                "default_tiled": True,    # Enable tiling by default
+                "default_steps": 2,       # Fewer steps for low VRAM mode
+                "load_vae_with_diffusion": False,  # Load VAE separately
+            }
+        }
+
+        # Download models if needed
         try:
             model_files = ["stepfun-ai.tar"]
             if not os.path.exists(MODEL_CACHE):
                 os.makedirs(MODEL_CACHE)
-
             for model_file in model_files:
                 url = BASE_URL + model_file
                 filename = url.split("/")[-1]
@@ -72,116 +100,169 @@ class Predictor(BasePredictor):
         if os.path.exists(lib_path):
             try:
                 torch.ops.load_library(lib_path)
-                print("[setup] Successfully loaded compiled attention library.")
+                print("[setup] Successfully loaded compiled attention library")
             except Exception as e:
                 print("[setup] Could not load compiled attention library:", e)
 
-        # Create model manager and load models
-        self.model_manager = ModelManager()
+    def _load_pipeline_for_mode(self, mode: str) -> StepVideoPipeline:
+        """Load pipeline for specified mode if not already loaded"""
+        if mode in self.pipelines:
+            return self.pipelines[mode]
+
+        config = self.mode_config[mode]
+        print(f"[load_pipeline] Loading '{mode}' pipeline...")
         
-        # 1) text encoder in float32
-        self.model_manager.load_models(
+        # Force single GPU usage
+        device = "cuda:0"
+        model_manager = ModelManager()
+        
+        # 1. Text encoder (always float32)
+        model_manager.load_models(
             ["models/stepfun-ai/stepvideo-t2v/hunyuan_clip/clip_text_encoder/pytorch_model.bin"],
             torch_dtype=torch.float32,
-            device="cpu"
+            device=device  # Changed from "cpu" to device
+        )
+
+        # 2. Step LLM and diffusion (with optional VAE for standard mode)
+        diffusion_paths = [
+            "models/stepfun-ai/stepvideo-t2v/step_llm",
+        ]
+        
+        if config["load_vae_with_diffusion"]:
+            diffusion_paths.append("models/stepfun-ai/stepvideo-t2v/vae/vae_v2.safetensors")
+            
+        diffusion_paths.append([
+            "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00001-of-00006.safetensors",
+            "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00002-of-00006.safetensors",
+            "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00003-of-00006.safetensors",
+            "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00004-of-00006.safetensors",
+            "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00005-of-00006.safetensors",
+            "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00006-of-00006.safetensors",
+        ])
+        
+        model_manager.load_models(
+            diffusion_paths,
+            torch_dtype=config["diffusion_dtype"],
+            device=device  # Changed from "cpu" to device
+        )
+
+        # 3. Load VAE separately for quantized/low_vram modes
+        if not config["load_vae_with_diffusion"]:
+            model_manager.load_models(
+                ["models/stepfun-ai/stepvideo-t2v/vae/vae_v2.safetensors"],
+                torch_dtype=torch.bfloat16,
+                device=device  # Changed from "cpu" to device
+            )
+
+        # Create pipeline
+        pipe = StepVideoPipeline.from_model_manager(
+            model_manager,
+            torch_dtype=torch.bfloat16,
+            device=device  # Changed from "cuda" to explicit "cuda:0"
         )
         
-        # 2) step_llm and diffusion in bfloat16
-        self.model_manager.load_models(
-            [
-                "models/stepfun-ai/stepvideo-t2v/step_llm",
-                [
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00001-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00002-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00003-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00004-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00005-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00006-of-00006.safetensors",
-                ],
-            ],
-            torch_dtype=torch.bfloat16,
+        # Configure VRAM management
+        if config["vram_params"] is not None:
+            pipe.enable_vram_management(num_persistent_param_in_dit=config["vram_params"])
+
+        self.pipelines[mode] = pipe
+        return pipe
+
+    def predict(
+        self,
+        prompt: str = Input(description="Prompt text", default="An astronaut on the Moon"),
+        negative_prompt: str = Input(description="Negative prompt", default="low resolution, text"),
+        mode: str = Input(
+            description="Mode: Choose between standard quantization, low VRAM optimizations, or both combined",
+            default="low_vram",
+            choices=["quantized", "low_vram", "quantized_low_vram"]
+        ),
+        num_inference_steps: int = Input(description="Number of inference steps", default=None),
+        num_frames: int = Input(description="Number of frames", default=51),
+        seed: int = Input(description="Random seed. Leave blank for random", default=None),
+        cfg_scale: float = Input(description="Classifier free guidance scale", default=9.0),
+    ) -> Path:
+        """Run prediction"""
+        use_low_vram = (mode == "low_vram" or mode == "quantized_low_vram")
+        use_quantized = (mode == "quantized" or mode == "quantized_low_vram")
+        
+        if num_inference_steps is None:
+            num_inference_steps = 2 if use_low_vram else 30
+
+        if seed is None:
+            seed = torch.randint(0, 2**32 - 1, (1,)).item()
+            print(f"Using random seed: {seed}")
+
+        # Load models exactly as in the examples
+        model_manager = ModelManager()
+        
+        # 1. Text encoder (same for both modes)
+        model_manager.load_models(
+            ["models/stepfun-ai/stepvideo-t2v/hunyuan_clip/clip_text_encoder/pytorch_model.bin"],
+            torch_dtype=torch.float32, 
             device="cpu"
         )
 
-        # 3) VAE in bfloat16
-        self.model_manager.load_models(
+        # 2. Step LLM and diffusion
+        diffusion_paths = [
+            "models/stepfun-ai/stepvideo-t2v/step_llm",
+            [
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00001-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00002-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00003-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00004-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00005-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00006-of-00006.safetensors",
+            ]
+        ]
+        
+        # Use different dtype based on mode
+        model_manager.load_models(
+            diffusion_paths,
+            torch_dtype=torch.float8_e4m3fn if use_quantized else torch.bfloat16,
+            device="cpu"
+        )
+
+        # 3. VAE (same for both modes)
+        model_manager.load_models(
             ["models/stepfun-ai/stepvideo-t2v/vae/vae_v2.safetensors"],
             torch_dtype=torch.bfloat16,
             device="cpu"
         )
 
         # Create pipeline
-        self.pipe = StepVideoPipeline.from_model_manager(
-            self.model_manager,
+        pipe = StepVideoPipeline.from_model_manager(
+            model_manager,
             torch_dtype=torch.bfloat16,
             device="cuda"
         )
 
-        # Enable VRAM management
-        self.pipe.enable_vram_management(num_persistent_param_in_dit=0)
+        # Set VRAM management based on mode
+        pipe.enable_vram_management(
+            num_persistent_param_in_dit=0 if use_low_vram else None
+        )
 
-    def predict(
-        self,
-        prompt: str = Input(description="Prompt text", default="An astronaut on the Moon..."),
-        negative_prompt: str = Input(description="Negative prompt", default="low resolution, text"),
-        num_inference_steps: int = Input(description="Steps", default=30, ge=1, le=50),
-        cfg_scale: float = Input(description="CFG scale", default=9.0),
-        num_frames: int = Input(description="How many frames to create", default=51, ge=8),
-        seed: int = Input(description="Random seed", default=42),
-        tiled: bool = Input(description="Enable tiled generation", default=False),
-        tile_size: int = Input(description="Tile size", default=34),
-        tile_stride: int = Input(description="Tile stride", default=16),
-    ) -> Path:
-        """Run a single prediction on the model"""
-        pipeline_args = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "num_inference_steps": num_inference_steps,
-            "cfg_scale": cfg_scale,
-            "num_frames": num_frames,
-            "seed": seed,
-            "tiled": tiled,
-            "tile_size": (tile_size, tile_size),
-            "tile_stride": (tile_stride, tile_stride),
-        }
+        # Run prediction with mode-specific settings
+        video = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_inference_steps=num_inference_steps,
+            cfg_scale=cfg_scale,
+            num_frames=num_frames,
+            seed=seed,
+            tiled=use_low_vram,
+            tile_size=(34, 34) if use_low_vram else None,
+            tile_stride=(16, 16) if use_low_vram else None,
+        )
 
-        print("[predict] Starting generation with:", pipeline_args)
-        video = self.pipe(**pipeline_args)
+        # Save video
         out_path = "video.mp4"
-        
-        # Convert video to correct format
-        if isinstance(video, list):
-            import numpy as np
-            video = np.stack(video)
-        
-        # Ensure video is in the format [T, H, W, C]
-        if video.shape[-1] != 3:  # If channels are not last
-            video = np.moveaxis(video, 1, -1)  # Move channels to last dimension
-        
-        # Ensure values are in uint8 range [0, 255]
-        if video.dtype != np.uint8:
-            video = (video * 255).clip(0, 255).astype(np.uint8)
-        
-        # Ensure dimensions are divisible by 16
-        h, w = video.shape[1:3]
-        new_h = ((h + 15) // 16) * 16
-        new_w = ((w + 15) // 16) * 16
-        
-        if h != new_h or w != new_w:
-            import torch.nn.functional as F
-            # Temporarily move channels first for padding
-            video = np.moveaxis(video, -1, 1)
-            video = F.pad(torch.from_numpy(video), (0, new_w - w, 0, new_h - h), mode='replicate').numpy()
-            # Move channels back to last position
-            video = np.moveaxis(video, 1, -1)
-
         save_video(
-            video, 
-            out_path, 
-            fps=25, 
+            video,
+            out_path,
+            fps=25,
             quality=5,
             ffmpeg_params=["-vf", "atadenoise=0a=0.1:0b=0.1:1a=0.1:1b=0.1"]
         )
 
-        print(f"[predict] Done! Saved video to {out_path}")
         return Path(out_path)
