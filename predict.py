@@ -11,16 +11,6 @@ import time
 from modelscope import snapshot_download
 from diffsynth import ModelManager, StepVideoPipeline, save_video
 
-###############################################################################
-# You can set STEPVIDEO_MODE to one of: "standard", "quantized", or "low_vram"
-# ENV example:
-#   STEPVIDEO_MODE=quantized cog build
-#   cog predict -i prompt="..."   # uses float8 for diffusion
-#
-# If STEPVIDEO_MODE is "low_vram", we still load bfloat16 but also default
-# to more aggressive VRAM usage settings in setup below.
-###############################################################################
-
 MODEL_CACHE = "models"
 BASE_URL = f"https://weights.replicate.delivery/default/StepVideo/{MODEL_CACHE}/"
 os.environ["HF_HOME"] = MODEL_CACHE
@@ -50,13 +40,16 @@ def download_weights(url: str, dest: str) -> None:
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        """Load the model into memory to make running multiple predictions efficient"""
-        # Attempt custom tar model download first, else fallback
+        """Load the model into memory exactly once for faster re-use."""
+        # Ensure model cache directory exists
+        os.makedirs(MODEL_CACHE, exist_ok=True)
+        
+        # 1) Download or ensure model is present
         try:
+            # Attempt custom tar download
             model_files = ["stepfun-ai.tar"]
             if not os.path.exists(MODEL_CACHE):
                 os.makedirs(MODEL_CACHE)
-
             for model_file in model_files:
                 url = BASE_URL + model_file
                 filename = url.split("/")[-1]
@@ -67,121 +60,104 @@ class Predictor(BasePredictor):
             print("[!] Custom tar download failed. Using Modelscope fallback.")
             snapshot_download(model_id="stepfun-ai/stepvideo-t2v", cache_dir=MODEL_CACHE)
 
-        # Load compiled attention library
+        # 2) Optionally load compiled attention kernel
         lib_path = f"{MODEL_CACHE}/stepfun-ai/stepvideo-t2v/lib/liboptimus_ths-torch2.5-cu124.cpython-310-x86_64-linux-gnu.so"
         if os.path.exists(lib_path):
             try:
                 torch.ops.load_library(lib_path)
-                print("[setup] Successfully loaded compiled attention library.")
+                print("[setup] Successfully loaded compiled attention library")
             except Exception as e:
                 print("[setup] Could not load compiled attention library:", e)
-
-        # Create model manager and load models
-        self.model_manager = ModelManager()
         
-        # 1) text encoder in float32
+        # 3) Build pipeline once and store in self.pipe
+        print("[setup] Building pipeline for inference...")
+        self.model_manager = ModelManager()
+
+        # a) Text encoder, float32 on CPU
         self.model_manager.load_models(
             ["models/stepfun-ai/stepvideo-t2v/hunyuan_clip/clip_text_encoder/pytorch_model.bin"],
             torch_dtype=torch.float32,
             device="cpu"
         )
-        
-        # 2) step_llm and diffusion in bfloat16
-        self.model_manager.load_models(
+
+        # b) Step LLM & diffusion, float8 on CPU
+        diffusion_assets = [
+            "models/stepfun-ai/stepvideo-t2v/step_llm",
             [
-                "models/stepfun-ai/stepvideo-t2v/step_llm",
-                [
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00001-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00002-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00003-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00004-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00005-of-00006.safetensors",
-                    "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00006-of-00006.safetensors",
-                ],
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00001-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00002-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00003-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00004-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00005-of-00006.safetensors",
+                "models/stepfun-ai/stepvideo-t2v/transformer/diffusion_pytorch_model-00006-of-00006.safetensors",
             ],
-            torch_dtype=torch.bfloat16,
+        ]
+        self.model_manager.load_models(
+            diffusion_assets,
+            torch_dtype=torch.float8_e4m3fn,
             device="cpu"
         )
 
-        # 3) VAE in bfloat16
+        # c) VAE, bfloat16 on CPU
         self.model_manager.load_models(
             ["models/stepfun-ai/stepvideo-t2v/vae/vae_v2.safetensors"],
             torch_dtype=torch.bfloat16,
             device="cpu"
         )
 
-        # Create pipeline
+        # d) Create pipeline on GPU with bfloat16
         self.pipe = StepVideoPipeline.from_model_manager(
             self.model_manager,
             torch_dtype=torch.bfloat16,
             device="cuda"
         )
 
-        # Enable VRAM management
-        self.pipe.enable_vram_management(num_persistent_param_in_dit=0)
+        # e) Enable VRAM management
+        self.pipe.enable_vram_management(num_persistent_param_in_dit=None)
+        print("[setup] Pipeline is ready.")
 
     def predict(
         self,
-        prompt: str = Input(description="Prompt text", default="An astronaut on the Moon..."),
+        prompt: str = Input(description="Prompt text", default="An astronaut on the moon"),
         negative_prompt: str = Input(description="Negative prompt", default="low resolution, text"),
-        num_inference_steps: int = Input(description="Steps", default=30, ge=1, le=50),
-        cfg_scale: float = Input(description="CFG scale", default=9.0),
-        num_frames: int = Input(description="How many frames to create", default=51, ge=8),
-        seed: int = Input(description="Random seed", default=42),
-        tiled: bool = Input(description="Enable tiled generation", default=False),
-        tile_size: int = Input(description="Tile size", default=34),
-        tile_stride: int = Input(description="Tile stride", default=16),
+        num_inference_steps: int = Input(description="Number of inference steps", default=30, ge=1, le=100),
+        cfg_scale: float = Input(description="Classifier free guidance scale", default=9.0, ge=1.0, le=20.0),
+        num_frames: int = Input(description="Number of frames", default=51, ge=17, le=204),
+        fps: int = Input(description="Frames per second in output video", default=25, ge=10, le=60),
+        quality: int = Input(description="Video quality (0-10, 10 is highest quality)", default=5, ge=0, le=10),
+        seed: int = Input(description="Random seed. Leave blank for random", default=None),
     ) -> Path:
-        """Run a single prediction on the model"""
-        pipeline_args = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "num_inference_steps": num_inference_steps,
-            "cfg_scale": cfg_scale,
-            "num_frames": num_frames,
-            "seed": seed,
-            "tiled": tiled,
-            "tile_size": (tile_size, tile_size),
-            "tile_stride": (tile_stride, tile_stride),
-        }
+        """Run inference using the pre-loaded pipeline."""
+        # 1) Handle random seed
+        if seed is None:
+            seed = torch.randint(0, 2**32 - 1, (1,)).item()
+            print(f"[predict] Using random seed: {seed}")
+        torch.manual_seed(seed)
 
-        print("[predict] Starting generation with:", pipeline_args)
-        video = self.pipe(**pipeline_args)
-        out_path = "video.mp4"
-        
-        # Convert video to correct format
-        if isinstance(video, list):
-            import numpy as np
-            video = np.stack(video)
-        
-        # Ensure video is in the format [T, H, W, C]
-        if video.shape[-1] != 3:  # If channels are not last
-            video = np.moveaxis(video, 1, -1)  # Move channels to last dimension
-        
-        # Ensure values are in uint8 range [0, 255]
-        if video.dtype != np.uint8:
-            video = (video * 255).clip(0, 255).astype(np.uint8)
-        
-        # Ensure dimensions are divisible by 16
-        h, w = video.shape[1:3]
-        new_h = ((h + 15) // 16) * 16
-        new_w = ((w + 15) // 16) * 16
-        
-        if h != new_h or w != new_w:
-            import torch.nn.functional as F
-            # Temporarily move channels first for padding
-            video = np.moveaxis(video, -1, 1)
-            video = F.pad(torch.from_numpy(video), (0, new_w - w, 0, new_h - h), mode='replicate').numpy()
-            # Move channels back to last position
-            video = np.moveaxis(video, 1, -1)
-
-        save_video(
-            video, 
-            out_path, 
-            fps=25, 
-            quality=5,
-            ffmpeg_params=["-vf", "atadenoise=0a=0.1:0b=0.1:1a=0.1:1b=0.1"]
+        # 2) Run the pipeline
+        video = self.pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_inference_steps=num_inference_steps,
+            cfg_scale=cfg_scale,
+            num_frames=num_frames,
+            seed=seed
         )
 
-        print(f"[predict] Done! Saved video to {out_path}")
+        # 3) Save and return the video
+        out_path = "video.mp4"
+        
+        # Apply temporal denoising to reduce flickering
+        ffmpeg_params = ["-vf", "atadenoise=0a=0.1:0b=0.1:1a=0.1:1b=0.1"]
+        
+        # Save video
+        save_video(
+            video,
+            out_path,
+            fps=fps,
+            quality=quality,
+            ffmpeg_params=ffmpeg_params
+        )
+        print(f"[predict] Video saved to {out_path}")
+        
         return Path(out_path)
