@@ -120,11 +120,11 @@ class Predictor(BasePredictor):
         self,
         prompt: str = Input(description="Prompt text", default="An astronaut on the moon"),
         negative_prompt: str = Input(description="Negative prompt", default="low resolution, text"),
-        num_inference_steps: int = Input(description="Number of inference steps", default=30),
-        cfg_scale: float = Input(description="Classifier free guidance scale", default=9.0),
-        num_frames: int = Input(description="Number of frames", default=51),
-        fps: int = Input(description="Frames per second in output video", default=25),
-        quality: int = Input(description="Video quality (0-10, 10 is highest quality)", default=5),
+        num_inference_steps: int = Input(description="Number of inference steps", default=30, ge=1, le=100),
+        cfg_scale: float = Input(description="Classifier free guidance scale", default=9.0, ge=1.0, le=20.0),
+        num_frames: int = Input(description="Number of frames", default=51, ge=17, le=204),
+        fps: int = Input(description="Frames per second in output video", default=25, ge=10, le=60),
+        quality: int = Input(description="Video quality (0-10, 10 is highest quality)", default=5, ge=0, le=10),
         seed: int = Input(description="Random seed. Leave blank for random", default=None),
     ) -> Path:
         """Run inference using the pre-loaded pipeline."""
