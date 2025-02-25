@@ -1,6 +1,5 @@
 # Step Video T2V Cog Implementation 🎥
 
-[![Cog](https://img.shields.io/endpoint?url=https://cloud-54hah6i3f-hack-club-bot.vercel.app/api/cog-badge.json)](https://cog.run)
 [![Replicate](https://replicate.com/zsxkib/step-video-t2v/badge)](https://replicate.com/zsxkib/step-video-t2v)
 [![Hugging Face](https://img.shields.io/badge/🤗%20Model-Card-yellow)](https://huggingface.co/stepfun-ai/stepvideo-t2v-turbo)
 
